@@ -413,6 +413,10 @@ pub(crate) async fn handle_output_item_done(
     match ToolRouter::build_tool_call(item.clone()) {
         // The model emitted a tool call; log it, persist the item immediately, and queue the tool execution.
         Ok(Some(call)) => {
+            
+            //   Multi-agent V2: opens the mailbox so other agents can deliver messages to
+            //   this turn while the tool runs. Must happen before the tool future is
+            // spawned.
             ctx.sess
                 .input_queue
                 .accept_mailbox_delivery_for_current_turn(
@@ -429,10 +433,15 @@ pub(crate) async fn handle_output_item_done(
                 payload_preview
             );
 
+            // Persists the FunctionCall item to the conversation history immediately,
+            // before the tool runs. The history always has the call even if execution is
+            // cancelled.
             record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
                 .await;
 
             let cancellation_token = ctx.cancellation_token.child_token();
+
+            // handle_tool_call (parallel.rs:63) is where the tool actually runs.
             let tool_future: InFlightFuture<'static> = Box::pin(
                 ctx.tool_runtime
                     .clone()

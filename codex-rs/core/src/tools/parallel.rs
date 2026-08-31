@@ -118,6 +118,7 @@ impl ToolCallRuntime {
                     Either::Right(lock.write().await)
                 };
 
+                // This is where tool executes
                 router
                     .dispatch_tool_call_with_terminal_outcome(
                         session,

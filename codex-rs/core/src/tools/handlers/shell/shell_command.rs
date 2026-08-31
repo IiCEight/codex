@@ -175,6 +175,9 @@ impl ToolExecutor<ToolInvocation> for ShellCommandHandler {
         )
         .await;
         let prefix_rule = params.prefix_rule.clone();
+
+        //   to_exec_params() (line 85) converts the parsed JSON params into the
+        //   internal ExecParams struct:
         let exec_params = Self::to_exec_params(
             &params,
             session.as_ref(),
@@ -183,6 +186,8 @@ impl ToolExecutor<ToolInvocation> for ShellCommandHandler {
             turn.config.permissions.allow_login_shell,
         )?;
         let shell_type = Some(session.user_shell().shell_type);
+
+        
         run_exec_like(RunExecLikeArgs {
             tool_name,
             exec_params,

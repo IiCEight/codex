@@ -416,6 +416,7 @@ impl Default for AppServerRuntimeOptions {
     }
 }
 
+// This is a start up function.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_main_with_transport_options(
     arg0_paths: Arg0DispatchPaths,
@@ -454,6 +455,8 @@ pub async fn run_main_with_transport_options(
     }
     .map(Arc::new)
     .map_err(std::io::Error::other)?;
+
+    // creates the config loader (no IO yet)
     let config_manager = ConfigManager::new(
         codex_home.to_path_buf(),
         cli_kv_overrides.clone(),
@@ -463,6 +466,8 @@ pub async fn run_main_with_transport_options(
         arg0_paths.clone(),
         Arc::new(NoopThreadConfigLoader),
     );
+
+    // first load: to discover cloud config loaders
     match config_manager
         .load_latest_config(/*fallback_cwd*/ None)
         .await
@@ -484,6 +489,8 @@ pub async fn run_main_with_transport_options(
         }
     };
     let mut config_warnings = Vec::new();
+
+    // second load: full config with cloud layers merged
     let (mut config, should_run_personality_migration) = match config_manager
         .load_latest_config(/*fallback_cwd*/ None)
         .await
@@ -531,6 +538,8 @@ pub async fn run_main_with_transport_options(
         }
         _ => None,
     };
+
+    // init SQLite state DB
     let state_db = match rollout_state_db::try_init(&config).await {
         Ok(state_db) => Some(state_db),
         Err(err) => {
@@ -798,6 +807,15 @@ pub async fn run_main_with_transport_options(
         ));
         let initialize_notification_sender = outgoing_message_sender.clone();
         let outbound_control_tx = outbound_control_tx;
+
+        // MessageProcessor (line 810, Arc::new(MessageProcessor::new(...))) is 
+        //   the central dispatcher — it owns all the *RequestProcessor structs and
+        //   routes every incoming JSON-RPC request to the right one.
+
+        //   - processor_handle — decides when to call the processor (connection
+        //   lifecycle, initialization gating, shutdown logic)
+        //   - MessageProcessor — decides what to do with a request (deserialize →
+        //   dispatch → call the right sub-processor)
         let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
             outgoing: outgoing_message_sender,
             analytics_events_client,

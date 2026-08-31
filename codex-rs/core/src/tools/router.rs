@@ -46,6 +46,8 @@ pub(crate) struct ToolRouterParams<'a> {
 
 impl ToolRouter {
     pub fn from_turn_context(turn_context: &TurnContext, params: ToolRouterParams<'_>) -> Self {
+        // this is important step
+        // It create the instance of `ToolRouter`
         build_tool_router(turn_context, params)
     }
 
@@ -206,6 +208,8 @@ impl ToolRouter {
             payload,
         } = call;
 
+        // Assemble ToolInvocation — the value passed to every handle() call.
+        // Everything the handler needs is bundled here
         let invocation = ToolInvocation {
             session,
             turn,

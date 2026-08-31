@@ -135,10 +135,10 @@ use tracing::warn;
 pub(crate) async fn run_turn(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
-    turn_extension_data: Arc<codex_extension_api::ExtensionData>,
+    turn_extension_data: Arc<codex_extension_api::ExtensionData>, // used to add extensions(plugins, connectors)
     input: Vec<TurnInput>,
-    prewarmed_client_session: Option<ModelClientSession>,
-    cancellation_token: CancellationToken,
+    prewarmed_client_session: Option<ModelClientSession>, // used to make a requset to LLM.
+    cancellation_token: CancellationToken,  //used to interrupt.
 ) -> Option<String> {
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
@@ -981,10 +981,15 @@ async fn run_sampling_request(
     input: Vec<ResponseItem>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
+
+    // Tool was built.
     let router = built_tools(sess.as_ref(), turn_context.as_ref(), &cancellation_token).await?;
 
     let base_instructions = sess.get_base_instructions().await;
 
+    // This is the core engine of tool execution.
+    // Every tool call that fires within the same sampling round shares the same
+    // ToolCallRuntime instance
     let tool_runtime = ToolCallRuntime::new(
         Arc::clone(&router),
         Arc::clone(&sess),
@@ -1917,7 +1922,8 @@ async fn try_run_sampling_request(
                     | ResponseItem::ContextCompaction { .. }
                     | ResponseItem::Other => false,
                 };
-
+                
+                // The main place to call tools.
                 let output_result =
                     match handle_output_item_done(&mut ctx, item, previously_streamed_item)
                         .instrument(handle_responses)
@@ -2113,6 +2119,7 @@ async fn try_run_sampling_request(
                 call_id,
                 delta,
             } => {
+                //  If it is a FunctionCall the active_tool_argument_diff_consumer is None
                 let Some((active_call_id, consumer)) = active_tool_argument_diff_consumer.as_mut()
                 else {
                     continue;

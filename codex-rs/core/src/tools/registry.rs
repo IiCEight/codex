@@ -440,6 +440,8 @@ impl ToolRegistry {
         }
 
         let dispatch_trace = ToolDispatchTrace::start(&invocation);
+
+        // Get the handler
         let tool = match self.tool(&tool_name) {
             Some(tool) => tool,
             None => {
@@ -490,7 +492,8 @@ impl ToolRegistry {
             dispatch_trace.record_failed(&err);
             return Err(err);
         }
-
+        
+        // lifecycle: tool start
         notify_tool_start(&invocation).await;
 
         if let Some(pre_tool_use_payload) = tool.pre_tool_use_payload(&invocation) {
