@@ -146,6 +146,7 @@ pub(crate) async fn run_turn(
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
     // when they would push the thread over the compaction threshold.
+    // compaction brefore turn starts.
     if let Err(err) = run_pre_sampling_compact(&sess, &turn_context, &mut client_session).await {
         let error = err.to_codex_protocol_error();
         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
@@ -154,9 +155,13 @@ pub(crate) async fn run_turn(
         return None;
     }
 
+    // the last turn's environment state — model slug, cwd, tool list, approval policy, workspace roots, etc.
+    // It store in `reference_context_item` which is a field on ContextManager.
+    // And update the turn context.
     sess.record_context_updates_and_set_reference_context_item(turn_context.as_ref())
         .await;
 
+    // find all skills and plugins injection items
     let (injection_items, explicitly_enabled_connectors) =
         build_skills_and_plugins(&sess, turn_context.as_ref(), &input, &cancellation_token).await?;
 
@@ -164,6 +169,8 @@ pub(crate) async fn run_turn(
         return None;
     }
     let mut can_drain_pending_input = input.is_empty();
+    
+    // This will record the input into the history which is in ContextManager.items.
     if run_hooks_and_record_inputs(&sess, &turn_context, &input).await {
         return None;
     }
@@ -175,6 +182,7 @@ pub(crate) async fn run_turn(
         realtime_active: Some(turn_context.realtime_active),
     }))
     .await;
+    // record all skills and plugins injection items into history which will be sent to llm later.
     for response_item in injection_items {
         sess.record_conversation_items(&turn_context, std::slice::from_ref(&response_item))
             .await;
@@ -209,11 +217,13 @@ pub(crate) async fn run_turn(
             Vec::new()
         };
 
+        // If there is a steer input, it will record the input into the history which is in ContextManager.items.
         if run_hooks_and_record_inputs(&sess, &turn_context, &pending_input).await {
             break;
         }
 
         // Construct the input that we will send to the model.
+        // It just clone the entire history (ContextManager and call the for_prompt)
         let sampling_request_input: Vec<ResponseItem> = {
             sess.clone_history()
                 .await
@@ -761,8 +771,12 @@ async fn run_pre_sampling_compact(
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
 ) -> CodexResult<()> {
+    // handle the case the switch a model with a smaller context window mid-conversation.
+    // if no switch it will do nothing.
     maybe_run_previous_model_inline_compact(sess, turn_context, client_session).await?;
+
     let token_status = auto_compact_token_status(sess.as_ref(), turn_context.as_ref()).await;
+
     // Compact if the configured auto-compaction budget or usable context window is exhausted.
     if token_status.token_limit_reached {
         run_auto_compact(
@@ -834,6 +848,7 @@ async fn maybe_run_previous_model_inline_compact(
     Ok(())
 }
 
+// three ways router:remote v2, remote v1, local
 async fn run_auto_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
@@ -879,6 +894,7 @@ async fn run_auto_compact(
             "local",
             /*manual*/ false,
         );
+        // local
         run_inline_auto_compact_task(
             Arc::clone(sess),
             Arc::clone(turn_context),
@@ -985,6 +1001,7 @@ async fn run_sampling_request(
     // Tool was built.
     let router = built_tools(sess.as_ref(), turn_context.as_ref(), &cancellation_token).await?;
 
+    // This get the base_instructions (system prompt)
     let base_instructions = sess.get_base_instructions().await;
 
     // This is the core engine of tool execution.

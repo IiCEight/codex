@@ -156,6 +156,7 @@ async fn run_compact_task_inner(
             return Err(CodexErr::TurnAborted);
         }
     }
+    // The actual work.
     let result = run_compact_task_inner_impl(
         Arc::clone(&sess),
         Arc::clone(&turn_context),
@@ -201,6 +202,9 @@ async fn run_compact_task_inner_impl(
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(&turn_context, &compaction_item)
         .await;
+
+    // Takes a snapshot clone of the current live history, then appends the compaction prompt
+    // to that clone.
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
 
     let mut history = sess.clone_history().await;
@@ -286,14 +290,24 @@ async fn run_compact_task_inner_impl(
         }
     }
 
+    // this history contains all previous histroy plus the compact summary in the end.
+    // And no compact prompt.
     let history_snapshot = sess.clone_history().await;
     let history_items = history_snapshot.raw_items();
+    // Last assistant message is the compact result.
     let summary_suffix = get_last_assistant_message_from_turn(history_items).unwrap_or_default();
     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
+
+    // keep all user input.
     let user_messages = collect_user_messages(history_items);
 
+    // only keep COMPACT_USER_MESSAGE_MAX_TOKENS=20000 newest user message, and drop all.Then append summary.
+    // [ initial_context items (empty for local compaction)  ]
+    // [ selected user messages, oldest-first, up to 20k tokens ]
+    // [ summary as final user message                        ]
     let mut new_history = build_compacted_history(Vec::new(), &user_messages, &summary_text);
 
+    // if need inject the initial context and reference_context_item
     if matches!(
         initial_context_injection,
         InitialContextInjection::BeforeLastUserMessage
@@ -310,6 +324,8 @@ async fn run_compact_task_inner_impl(
         message: summary_text.clone(),
         replacement_history: Some(new_history.clone()),
     };
+
+    // update to new_history.
     sess.replace_compacted_history(new_history, reference_context_item, compacted_item)
         .await;
     sess.recompute_token_usage(&turn_context).await;

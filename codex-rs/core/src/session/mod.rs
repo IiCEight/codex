@@ -3006,12 +3006,21 @@ impl Session {
         &self,
         turn_context: &TurnContext,
     ) {
+        // get current `reference_context_item` which is maintained by its inner ContextManager.
         let reference_context_item = {
             let state = self.state.lock().await;
             state.reference_context_item()
         };
         let should_inject_full_context = reference_context_item.is_none();
+
+        // so context_items is a Vec<ResponseItem> with role: developer in it if it is first time built. Otherwise it is one ResponseItem with only diff to save token.
+        // 1. One bundled developer message (all developer_sections joined)
+        // 2. One or more separate developer messages(separate_developer_sections — guardian only)
+        // 3. One multi-agent usage hint developer message
+        // 4. One contextual user message (contextual_user_sections joined)
         let context_items = if should_inject_full_context {
+            // This build_initial_context is a pure builder — it just   
+            // constructs and returns at most 4 ResponseItem.
             self.build_initial_context(turn_context).await
         } else {
             // Steady-state path: append only context diffs to minimize token overhead.
@@ -3019,6 +3028,7 @@ impl Session {
                 .await
         };
         let turn_context_item = turn_context.to_turn_context_item();
+
         if !context_items.is_empty() {
             self.record_conversation_items(turn_context, &context_items)
                 .await;
@@ -3031,6 +3041,7 @@ impl Session {
         // Advance the in-memory diff baseline even when this turn emitted no model-visible
         // context items. This keeps later runtime diffing aligned with the current turn state.
         let mut state = self.state.lock().await;
+        // set the reference_context_item in ContextManager
         state.set_reference_context_item(Some(turn_context_item));
     }
 

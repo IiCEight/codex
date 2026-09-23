@@ -1324,7 +1324,14 @@ let sampling_request_input = sess.clone_history().await
     .for_prompt(&turn_context.model_info.input_modalities);
 ```
 
-Clones the full conversation history and filters it to only the content types the current model supports (e.g. drops images if the model has no vision). This is the complete prompt that goes to the model — everything accumulated so far including context items, injected skills/plugins, tool results, etc.
+Clones the full conversation history and filters it to only the content types the current model supports (e.g. drops images if the model has no vision). This is the complete prompt **for this iteration of the outer loop** — everything accumulated so far including context items, injected skills/plugins, tool results, etc.
+
+This clone is passed to `run_sampling_request` as `initial_input`. Inside that function, on the **first** attempt it is used directly (via `initial_input.take()`). On a **retry** after a transient stream error, `initial_input` is already `None`, so the function does its **own** `clone_history().for_prompt()` — ensuring any tool results that were recorded during the failed attempt are included. Two separate clone sites, two separate purposes:
+
+| Clone site | When | Why |
+|---|---|---|
+| `run_turn:217` | Before each outer-loop iteration (i.e., before each `run_sampling_request`) | Captures history after pending-input drain + any mid-turn compact |
+| `run_sampling_request:1012` | On retry within a single sampling attempt | Captures tool results that may have been appended during the failed stream |
 
 **`turn_metadata_header` (lines 223–226)**
 
@@ -2223,276 +2230,269 @@ pub(crate) struct SessionServices {
 ### Prompt build
 
 Every sampling call to the model is driven by a `Prompt` struct
-(`core/src/client_common.rs:18`).  Understanding prompt build means tracing
-how that struct is populated.
+(`core/src/client_common.rs:18`). This section traces exactly how that struct
+is populated, following the code flow from the moment a user message arrives to
+the moment `client_session.stream(prompt, ...)` is called.
 
 ---
 
-#### The `Prompt` struct
+#### `ContextManager` — the conversation history buffer
+
+`ContextManager` (`core/src/context_manager/history.rs:34`) is the **only**
+structure that holds the conversation history. Every item ever written — user
+messages, assistant messages, tool calls, tool outputs — ends up as a
+`ResponseItem` appended to its single internal `Vec`.
 
 ```rust
-// core/src/client_common.rs:18
-pub struct Prompt {
-    /// Conversation context input items.
-    pub input: Vec<ResponseItem>,
-
-    /// Tools available to the model, including additional tools sourced from
-    /// external MCP servers.
-    pub(crate) tools: Vec<ToolSpec>,
-
-    /// Whether parallel tool calls are permitted for this prompt.
-    pub(crate) parallel_tool_calls: bool,
-
-    pub base_instructions: BaseInstructions,
-
-    /// Optionally specify the personality of the model.
-    pub personality: Option<Personality>,
-
-    /// Optional the output schema for the model's response.
-    pub output_schema: Option<Value>,
-
-    /// Whether the Responses API should strictly validate `output_schema`.
-    pub output_schema_strict: bool,
+pub(crate) struct ContextManager {
+    items: Vec<ResponseItem>,         // oldest → newest
+    history_version: u64,             // bumped on compaction / rollback rewrites
+    token_info: Option<TokenUsageInfo>,
+    reference_context_item: Option<TurnContextItem>,
 }
 ```
 
-Four concerns packed into one struct:
+It lives at `SessionState.history` (`state/session.rs:26`), behind the
+session-wide `Mutex<SessionState>`. It is **ephemeral per process** — not
+persisted directly. On resume or fork the `RolloutRecorder` JSONL is replayed
+to reconstruct it from scratch.
 
-| Field | What it carries |
-|---|---|
-| `input` | Full conversation history (user messages, assistant replies, tool calls/outputs, skill injections) |
-| `tools` | All tool specs visible to the model (built-in + MCP + extension tools) |
-| `base_instructions` | System/instructions text (maps to the `instructions` field in the Responses API) |
-| `parallel_tool_calls` / `output_schema*` | Per-model call-site settings |
+Two access paths:
+
+| Method | Returns | When used |
+|---|---|---|
+| `raw_items()` (`:125`) | `&[ResponseItem]` as-is | compaction, rollback, token estimation |
+| `for_prompt(modalities)` (`:119`) | normalized `Vec<ResponseItem>` | **every LLM call** |
+
+`for_prompt` clones the manager and calls `normalize_history`: validates
+call/output pairs, removes orphan tool calls, and strips images when the model's
+`input_modalities` excludes `InputModality::Image`. The result becomes
+`Prompt.input`.
+
+Only API-visible items are stored — `record_items` filters via `is_api_message`:
+
+```
+✓  user messages, assistant messages
+✓  function/tool calls and outputs (outputs truncated by TruncationPolicy)
+✓  local shell calls, reasoning items, web search / image generation calls
+✓  Compaction / ContextCompaction items
+✗  system-role messages  (kept in base_instructions instead)
+✗  CompactionTrigger     (internal marker, never sent to the model)
+```
 
 ---
 
-#### Where `build_prompt` is called
+#### Step 1 — wire input to `TurnInput`: app-server → core
 
-```
-run_turn (turn.rs:135)
- └─ run_sampling_request (turn.rs:974)
-     retry loop {
-       └─ build_prompt (turn.rs:1013)          ← constructs the Prompt
-       └─ try_run_sampling_request (turn.rs:1019)
-           └─ client_session.stream(prompt, ...)  ← sends it to the model
-     }
-```
-
-`build_prompt` is inside a retry loop — on each retry the history is
-re-snapshotted via `sess.clone_history().for_prompt()` (`turn.rs:1009`) so
-the `Prompt` always reflects the latest state of `ContextManager`.
-
-`build_prompt` at `turn.rs:945`:
+The app-server protocol has its own `UserInput` enum
+(`app-server-protocol/src/protocol/v2/turn.rs:270`) — the JSON-RPC wire type:
 
 ```rust
-pub(crate) fn build_prompt(
-    input: Vec<ResponseItem>,
-    router: &ToolRouter,
-    turn_context: &TurnContext,
-    base_instructions: BaseInstructions,
-) -> Prompt {
-    Prompt {
-        input,
-        tools: router.model_visible_specs(),
-        parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
-        base_instructions,
-        personality: turn_context.personality,
-        output_schema: turn_context.final_output_json_schema.clone(),
-        output_schema_strict: !crate::guardian::is_guardian_reviewer_source(
-            &turn_context.session_source,
-        ),
+pub enum UserInput {   // camelCase JSON fields
+    Text { text: String, text_elements: Vec<TextElement> },
+    Image { url: String, detail: Option<ImageDetail> },
+    LocalImage { path: PathBuf, detail: Option<ImageDetail> },
+    Skill { name: String, path: PathBuf },
+    Mention { name: String, path: String },
+}
+```
+
+At `turn_processor.rs:403`, each item is converted to the core type
+(`protocol/src/user_input.rs:15`) via `V2UserInput::into_core` — a mechanical
+field rename (`url` → `image_url`, etc.) — and packed into an `Op::UserInput`:
+
+```rust
+// turn_processor.rs:431
+let turn_op = Op::UserInput {
+    items: mapped_items,   // Vec<core::UserInput>
+    environments, final_output_json_schema, additional_context, thread_settings, ..
+};
+```
+
+`submission_loop` (`handlers.rs:738`) dispatches this to
+`user_input_or_turn_inner` (`handlers.rs:194`), which assembles
+`task_input: Vec<TurnInput>`:
+
+```rust
+// handlers.rs:265–275
+let mut task_input = additional_context_input
+    .into_iter()
+    .map(ResponseItem::from)
+    .map(TurnInput::ResponseItem)          // AdditionalContext items → ResponseItem
+    .collect::<Vec<_>>();
+if !items.is_empty() {
+    task_input.push(TurnInput::UserInput { // user message
+        content: items,                    // Vec<core::UserInput>
+        client_id: client_user_message_id,
+    });
+}
+sess.spawn_task(turn_context, task_input, RegularTask::new()).await;
+```
+
+`TurnInput` (`session/input_queue.rs:13`) is the task-boundary envelope:
+
+```rust
+pub(crate) enum TurnInput {
+    UserInput { content: Vec<UserInput>, client_id: Option<String> },
+    ResponseItem(ResponseItem),
+}
+```
+
+---
+
+#### Step 2 — `run_turn`: recording input into `ContextManager`
+
+`RegularTask::run` (`tasks/regular.rs:36`) passes `task_input` to `run_turn`.
+Inside `run_turn`, before the sampling loop, two things happen:
+
+**2a. `run_hooks_and_record_inputs` (`turn.rs:167`)** — iterates every
+`TurnInput` and calls `record_pending_input` (`hook_runtime.rs:532`):
+
+```rust
+match pending_input {
+    TurnInput::UserInput { content, client_id } =>
+        sess.record_user_prompt_and_emit_turn_item(turn_context, &content, client_id).await,
+    TurnInput::ResponseItem(item) =>
+        sess.record_conversation_items(turn_context, &[item]).await,
+}
+```
+
+For `UserInput`, `record_user_prompt_and_emit_turn_item` (`session/mod.rs:3185`)
+does the final conversion:
+
+```
+Vec<core::UserInput>
+  → ResponseInputItem::Message { role:"user", content: Vec<ContentItem> }
+      (via From<Vec<UserInput>> for ResponseInputItem, models.rs:1236)
+  → ResponseItem::Message { role:"user", content, id:None, phase:None }
+      (via From<ResponseInputItem> for ResponseItem, models.rs:1126)
+  → appended to ContextManager.items via record_conversation_items
+```
+
+The `From<Vec<UserInput>>` conversion at `models.rs:1236` maps each variant:
+
+```
+Text { text }        → ContentItem::InputText { text }
+Image { image_url }  → ContentItem::InputImage { image_url, detail }
+LocalImage { path }  → read file → base64 → ContentItem::InputImage
+Skill / Mention      → dropped (replaced by injection items in step 2b)
+```
+
+This call happens **before** the sampling loop. A second call inside the loop
+(`turn.rs:213`) handles steer input — messages the user sends while the model
+is running. It is gated by `can_drain_pending_input` (starts `false`), so on
+the first iteration it is a no-op if there is no steer input.
+
+**2b. Skill / plugin injection (`turn.rs:180`)** — `build_skills_and_plugins`
+(`turn.rs:435`) runs before `run_hooks_and_record_inputs` and resolves `@skill`
+and `plugin://` mentions from the raw user input into
+`injection_items: Vec<ResponseItem>`. After the user message is recorded, these
+are written to `ContextManager`:
+
+```rust
+for response_item in injection_items {
+    sess.record_conversation_items(&turn_context, std::slice::from_ref(&response_item)).await;
+}
+```
+
+Sources:
+
+| Function | What it adds |
+|---|---|
+| `build_skill_injections` | Skill prompt text (from `@skill` mentions or active skills) |
+| `build_plugin_injections` | Plugin guidance items (from `plugin://` mentions) |
+| `build_extension_turn_input_items` | Extension `TurnInputContributor` contributions |
+
+`UserInput::Skill` and `UserInput::Mention` wire variants are deliberately
+dropped in the `From<Vec<UserInput>>` conversion above — their content arrives
+here as full `ResponseItem`s instead.
+
+After steps 2a and 2b, `ContextManager.items` contains: user message →
+skill/plugin injections, in that order, ready for the first API call.
+
+---
+
+#### Step 3 — `run_sampling_request`: assembling the full `Prompt`
+
+`run_turn` calls `run_sampling_request` (`turn.rs:978`). Before entering its
+own retry loop, it builds the two remaining `Prompt` fields:
+
+**`built_tools` → `ToolRouter`** (`turn.rs:990`): reads `McpConnectionManager`,
+loads plugins, resolves connectors, builds a `ToolRouter` whose
+`model_visible_specs: Vec<ToolSpec>` are the JSON schemas sent to the model as
+`Prompt.tools`.
+
+**`get_base_instructions` → `BaseInstructions`** (`turn.rs:992`): reads
+`SessionState.session_configuration.base_instructions` — the system prompt
+text, frozen at session init from (in priority order):
+1. `config.base_instructions` override (CLI / config.toml)
+2. `history.get_base_instructions()` — stored in rollout for resumed threads
+3. `model_info.get_model_instructions(personality)` — model catalog default,
+   optionally with a `PERSONALITY_PLACEHOLDER` substitution
+
+Then the retry loop:
+
+```rust
+loop {
+    let prompt_input = initial_input.take()   // first attempt: pre-built history
+        .unwrap_or_else(|| sess.clone_history().await
+                               .for_prompt(&turn_context.model_info.input_modalities));
+    let prompt = build_prompt(prompt_input, &router, &turn_context, base_instructions.clone());
+    match try_run_sampling_request(&prompt, ...).await {
+        Ok(output)  => return Ok(output),
+        retryable   => { /* increment retries, re-clone history on next iteration */ }
+        fatal       => return Err(..),
     }
 }
 ```
 
----
+On retry, history is re-cloned fresh because the model may have partially
+written items back into `ContextManager` before the error.
 
-#### Part 1 — `base_instructions` (the system prompt)
-
-`BaseInstructions` is a simple newtype:
+**`build_prompt` (`turn.rs:949`)** — final assembly, no further modification:
 
 ```rust
-// protocol/src/models.rs:920
-pub struct BaseInstructions {
-    pub text: String,
+Prompt {
+    input:               prompt_input,                           // clone_history().for_prompt()
+    tools:               router.model_visible_specs(),           // MCP + built-in + extension specs
+    parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
+    base_instructions,                                           // system prompt text
+    personality:         turn_context.personality,
+    output_schema:       turn_context.final_output_json_schema.clone(),
+    output_schema_strict: !is_guardian_reviewer_source(&turn_context.session_source),
 }
 ```
 
-The `text` value flows through this chain:
-
-```
-models catalog (ModelInfo.base_instructions)
-  └─ ModelInfo::get_model_instructions(personality)
-      ├─ if model_messages.instructions_template exists
-      │     replace PERSONALITY_PLACEHOLDER with personality snippet
-      └─ else: return ModelInfo.base_instructions as-is
-
-Session::new (session.rs:564):
-  base_instructions = config.base_instructions          // CLI/API override?
-    .or_else(|| history.get_base_instructions())        // resumed thread?
-    .unwrap_or_else(|| model_info.get_model_instructions(config.personality))
-                                                        // ← default path
-
-Stored in SessionConfiguration.base_instructions (session.rs:64)
-
-Session::get_base_instructions (session/mod.rs:1172):
-    lock state → return BaseInstructions { text: state.session_configuration.base_instructions.clone() }
-
-run_sampling_request (turn.rs:986):
-    let base_instructions = sess.get_base_instructions().await;
-    ...
-    let prompt = build_prompt(input, router, turn_context, base_instructions);
-```
-
-The raw instruction text ultimately comes from:
-- **Primary**: the model's entry in the models catalog JSON (`ModelInfo.base_instructions`) — a static string baked into the binary
-- **Override**: `config.instructions` / `config.model_instructions_file` in `config.toml` or via CLI (`config/mod.rs:3246`)
-- **Resume**: `history.get_base_instructions()` — the instructions string stored in the rollout when the thread was originally created
-
-The default base instructions for all models are embedded via `include_str!`:
-```rust
-// protocol/src/models.rs:918
-pub const BASE_INSTRUCTIONS_DEFAULT: &str = include_str!("prompts/base_instructions/default.md");
-```
+`try_run_sampling_request` receives `prompt` as `&Prompt` and passes it
+directly to `client_session.stream(prompt, ...)` — no modification.
 
 ---
 
-#### Part 2 — `input` (the conversation history)
-
-The `input` field is built from `ContextManager` — the session's append-only conversation log:
+#### Complete flow (per sampling call)
 
 ```
-run_turn (turn.rs:217):
-    let sampling_request_input: Vec<ResponseItem> = {
-        sess.clone_history()
-            .await
-            .for_prompt(&turn_context.model_info.input_modalities)
-    };
-```
-
-`ContextManager::for_prompt` (`context_manager/history.rs:119`):
-
-```rust
-pub(crate) fn for_prompt(mut self, input_modalities: &[InputModality]) -> Vec<ResponseItem> {
-    self.normalize_history(input_modalities);
-    self.items
-}
-```
-
-`normalize_history` enforces three invariants before the items go to the model:
-1. Every function/tool call has a corresponding output (`ensure_call_outputs_present`)
-2. Every output has a corresponding call (`remove_orphan_outputs`)
-3. Images are stripped when the model does not support them (`strip_images_when_unsupported`)
-
-`ContextManager.items` is a `Vec<ResponseItem>` ordered oldest → newest.
-Items are appended by `record_items()` which also applies a `TruncationPolicy`
-to tool output payloads (caps oversized outputs before they enter the history).
-
-**What goes into `items`?**  Only API-visible items — `is_api_message` filters:
-
-```
-✓  user messages (role ≠ "system")
-✓  assistant messages
-✓  function/tool calls
-✓  function/tool outputs (truncated by TruncationPolicy)
-✓  local shell calls
-✓  reasoning items
-✓  web search calls / image generation calls
-✓  Compaction / ContextCompaction items
-
-✗  system-role messages  (kept separately in base_instructions)
-✗  CompactionTrigger     (internal marker, never sent to the model)
-✗  Other
-```
-
----
-
-#### Part 3 — skill / plugin injection items
-
-Before any sampling call, `build_skills_and_plugins` (`turn.rs:431`) prepares
-extra `ResponseItem` values that are **prepended to the history** for this turn:
-
-```rust
-// turn.rs:573
-let mut injection_items: Vec<ResponseItem> = /* skill_items + plugin_items + extension_items */;
-// turn.rs:583
-injection_items.extend(plugin_items);
-injection_items.extend(extension_injection_items);
-```
-
-These injection items are then committed to history before the first sampling
-call (`turn.rs:178–181`):
-
-```rust
-for response_item in injection_items {
-    sess.record_conversation_items(&turn_context, std::slice::from_ref(&response_item))
-        .await;
-}
-```
-
-Sources of injection items:
-
-| Source | What it adds |
-|---|---|
-| `build_skill_injections` | Skill prompt text (from `@skill` mentions or active skills) |
-| `build_plugin_injections` | Plugin guidance items (from `plugin://` mentions) |
-| `build_extension_turn_input_items` | Contributions from registered extension `TurnInputContributor`s |
-
----
-
-#### Part 4 — `tools` (the tool list)
-
-`router.model_visible_specs()` returns all tool specs the model can invoke.
-The `ToolRouter` is built by `built_tools` (`turn.rs:1077`):
-
-```
-built_tools (turn.rs:1077):
-  1. read McpConnectionManager (RwLock) → list all MCP tools
-  2. load plugins (plugins_manager.plugins_for_config)
-  3. determine accessible connectors (app tools)
-  4. run tool-suggest for discoverable tools
-  5. build_mcp_tool_exposure → partitions MCP tools into direct vs deferred
-  6. ToolRouter::from_turn_context(turn_context, ToolRouterParams { mcp_tools, deferred_mcp_tools, discoverable_tools, extension_tool_executors, dynamic_tools })
-```
-
-`ToolRouter` merges:
-- Built-in tools (shell execution, apply_patch, web_search, etc. — wired by `TurnContext`)
-- MCP server tools (from `McpConnectionManager`)
-- Extension-contributed tool executors
-- Dynamically-registered tools (`dynamic_tools`)
-
----
-
-#### Full prompt assembly sequence (per sampling call)
-
-```
-run_turn
-  1. run_pre_sampling_compact          ← compact if near token limit
-  2. record_context_updates_and_set_reference_context_item
-  3. build_skills_and_plugins          ← assemble injection_items + connector IDs
-  4. run_pending_session_start_hooks   ← fire session-start hooks (first turn only)
-  5. run_hooks_and_record_inputs       ← run pre-turn hooks; record user input → history
-  6. record injection_items → history  ← skill/plugin/extension items now in ContextManager
-  loop {
-    7. sess.clone_history().for_prompt() → sampling_request_input
-    8. run_sampling_request
-        a. built_tools()               ← build ToolRouter (MCP + built-in + extensions)
-        b. sess.get_base_instructions()← lock SessionState → read base_instructions text
-        c. build_prompt(input, router, turn_context, base_instructions)
-             Prompt {
-               input:               history items (normalized, images stripped if needed)
-               tools:               router.model_visible_specs()
-               base_instructions:   { text: model's system prompt string }
-               parallel_tool_calls: model_info.supports_parallel_tool_calls
-               personality:         turn_context.personality
-               output_schema:       turn_context.final_output_json_schema
-               output_schema_strict: !is_guardian_reviewer
-             }
-        d. client_session.stream(prompt, model_info, ...) → ResponseStream
-        e. loop over stream events → handle tool calls → append outputs to history
-           → if model returns text: emit EventMsg::AgentMessage, break
-  }
+JSON-RPC UserInput
+  │  V2UserInput::into_core()  (turn_processor.rs:403)
+  ▼
+core::UserInput  →  Op::UserInput  →  TurnInput::UserInput  (handlers.rs:265)
+  │
+  │  run_turn (turn.rs:135)
+  │    build_skills_and_plugins()     resolve @skill / plugin:// → injection_items
+  │    run_hooks_and_record_inputs()  UserInput → ResponseItem → ContextManager.items
+  │    record injection_items         skill/plugin ResponseItems → ContextManager.items
+  │
+  ▼
+ContextManager.items  [ user msg | skill injections | ... prior turns ... ]
+  │
+  │  clone_history().for_prompt()     normalize, strip unsupported images
+  ▼
+Prompt.input: Vec<ResponseItem>
+  +  Prompt.tools:             router.model_visible_specs()
+  +  Prompt.base_instructions: SessionConfiguration.base_instructions
+  +  Prompt.{parallel_tool_calls, personality, output_schema*}: TurnContext
+  │
+  ▼
+client_session.stream(prompt, ...)  →  model API call
 ```
 
 
@@ -2978,4 +2978,461 @@ session.active_turn.lock()            // outer: guards existence of active turn
 Two separate locks because the outer one is coarse (held briefly, many readers) and the inner one is fine-grained (only for mutation). The `#[expect(clippy::await_holding_invalid_type)]` attribute suppresses Clippy's warning about holding a mutex guard across `.await` — accepted intentionally to keep the counter increment atomic.
 
 
+### Context Management
+
+#### ContextManager — the single source of truth
+
+`ContextManager` (`core/src/context_manager/history.rs`) is the in-memory store for everything the model knows. It lives inside `SessionState` (behind a `Mutex`) and has two fields that together define "what the model knows" at any point in time:
+
+```
+ContextManager
+  ├─ items: Vec<ResponseItem>                      // full conversation history
+  └─ reference_context_item: Option<TurnContextItem>  // diff baseline from last turn
+```
+
+---
+
+#### `items` — the conversation history
+
+Ordered oldest-to-newest. Grows every turn:
+
+```
+[ ...previous turns ]
+[ context item (developer + contextual user)      ]  ← record_context_updates... (turn.rs:160)
+[ user message                                    ]  ← run_hooks_and_record_inputs (turn.rs:173)
+[ assistant response / tool calls / tool outputs ]  ← drain_to_completed / tool loop
+```
+
+Two consumers:
+- **`clone_history().for_prompt()`** — snapshots and normalizes `items` into the model API request each sampling iteration
+- **`collect_user_messages()`** — used by compaction to extract only real user messages, filtering out contextual injections and previous summaries
+
+`for_prompt()` enforces two invariants before serializing: every `FunctionCall` has a corresponding output (orphan outputs are removed), and images are stripped when the model has no vision capability.
+
+---
+
+#### `reference_context_item` — the diff baseline
+
+**Every turn, before the user message is recorded**, `record_context_updates_and_set_reference_context_item` (`turn.rs:160`) is called. Its job: inject environment context into `items` so the model knows its current operating state — cwd, model, tools, permissions, skills, plugins, personality, etc. This content is built almost entirely from `TurnContext`.
+
+Beyond writing into `items`, it also maintains `reference_context_item` — a `TurnContextItem` snapshot of the current turn's environment stored inside `ContextManager`. This enables diffing on the next turn:
+
+| `reference_context_item` | What fires | What gets injected into `items` |
+|---|---|---|
+| `None` (first turn, or after `DoNotInject` compaction) | `build_initial_context()` | Full env snapshot — developer bundle + contextual user message |
+| `Some(prev)` (steady state) | `build_settings_update_items()` | Only the fields that changed vs `prev` |
+
+The three destinations of `record_context_updates_and_set_reference_context_item`:
+
+```
+TurnContext (ephemeral, lives one turn)
+    │
+    ├─ build_initial_context() / build_settings_update_items()
+    │       └─ record_conversation_items()
+    │               └─► items  (model sees it)
+    │
+    └─ to_turn_context_item()
+            ├─► reference_context_item in ContextManager  (diff baseline for next turn)
+            └─► RolloutItem::TurnContext on disk           (thread resume/fork)
+```
+
+**`TurnContext` is ephemeral** — created fresh at turn start by `new_turn_with_sub_id` (`turn_context.rs:580`), dropped at turn end. It holds everything needed to run the turn (model info, approval policy, cwd, tools, features, etc.) but is never stored in the session. `TurnContextItem` is the durable projection — a serializable subset persisted to both `reference_context_item` and the rollout log.
+
+---
+
+#### `build_initial_context` — what a full snapshot contains (`session/mod.rs:2746`)
+
+Builds up to four `ResponseItem`s from `TurnContext` and session state:
+
+**`developer` message** (one bundled `ResponseItem::Message { role: "developer" }`):
+- Permissions instructions (tool approval rules, exec policy)
+- Developer instructions
+- Collaboration mode instructions
+- Personality spec (if not baked into the model)
+- Apps instructions (accessible MCP connectors)
+- Skills instructions (available `/slash-commands`)
+- Plugin capability summaries
+- Extension `ContextContributor` fragments
+
+**Separate `developer` messages** (one per entry in `separate_developer_sections`):
+- Guardian policy prompt — kept isolated so guardian subagents see it as a distinct block
+
+**Multi-agent usage hint** (one `developer` message, if applicable)
+
+**Contextual `user` message** (one `ResponseItem::Message { role: "user" }`, marked contextual):
+- `EnvironmentContext` — cwd, shell, workspace roots, subagent info
+- User instructions (e.g. `CLAUDE.md` content)
+- Extension `ContextContributor` fragments with `PromptSlot::ContextualUser`
+
+The contextual `user` message is marked so `is_contextual_user_message_content()` can identify and filter it during compaction — stale env snapshots must not survive into the compacted history.
+
+`build_initial_context` is a **pure builder** — no side effects, returns `Vec<ResponseItem>`. All writes happen in the caller.
+
+---
+
+#### Rollout persistence
+
+`LiveThread` (`thread-store/src/live_thread.rs`) is the durable append-only log for a conversation thread, backed by `ThreadStore` (local: `~/.codex/threads/<thread_id>/rollout.jsonl`). Every `ResponseItem`, compaction event, and `TurnContextItem` is appended as a `RolloutItem` JSON line.
+
+```rust
+pub enum RolloutItem {
+    SessionMeta(SessionMetaLine),      // thread metadata
+    ResponseItem(ResponseItem),        // every model/user/tool message
+    Compacted(CompactedItem),          // compaction summary + replacement history
+    TurnContext(TurnContextItem),      // env snapshot baseline per turn
+    EventMsg(EventMsg),                // warnings, token counts
+}
+```
+
+`TurnContextItem` is persisted **unconditionally** every turn even when `build_settings_update_items` emitted no visible diff — without it, thread resume cannot reconstruct the `reference_context_item` diff baseline.
+
+`ContextManager` is in-memory and ephemeral. The rollout log is what makes it recoverable across process restarts.
+
+
+### Compaction
+
+Compaction replaces the live conversation history with a compressed version — a model-generated summary plus a small window of recent user messages — so the session can continue without hitting the context window limit.
+
+#### Three backends
+
+Selected at runtime by `run_auto_compact` (`turn.rs:844`) based on provider and feature flag:
+
+```
+should_use_remote_compact_task(provider)?
+  ├─ yes + Feature::RemoteCompactionV2  →  compact_remote_v2.rs   (streaming, encrypted blob)
+  ├─ yes                                →  compact_remote.rs       (unary HTTP /responses/compact)
+  └─ no                                 →  compact.rs              (local, model summarizes inline)
+```
+
+Non-OpenAI providers (Ollama, LMStudio, Bedrock) always use local. Remote V1/V2 require an OpenAI-backed provider.
+
+---
+
+#### Four trigger points
+
+| Trigger | Location | Condition | `InitialContextInjection` | `CompactionPhase` |
+|---|---|---|---|---|
+| Pre-turn — model downshift | `turn.rs:150` → `maybe_run_previous_model_inline_compact` | switched to smaller model, current history overflows new model's window | `DoNotInject` | `PreTurn` |
+| Pre-turn — context limit | `turn.rs:150` → `run_pre_sampling_compact` | `token_limit_reached` before first model call | `DoNotInject` | `PreTurn` |
+| Mid-turn | `turn.rs:283` | `token_limit_reached && needs_follow_up` after a sampling response | `BeforeLastUserMessage` | `MidTurn` |
+| Manual `/compact` | `CompactTask::run` | user requested | `DoNotInject` | `StandaloneTurn` |
+
+Pre-turn compaction fires before `record_context_updates_and_set_reference_context_item` — so when it checks `auto_compact_token_status`, the incoming user message and context diff have not yet been recorded. This is a known limitation (TODO at `turn.rs:145`).
+
+Mid-turn fires inside the `Ok(sampling_request_output)` branch of the model↔tool loop — after every successful model response. Both conditions must be true simultaneously: context is full (`token_limit_reached`) AND the model still has work to do (`needs_follow_up` — either a tool result to return, or pending steered input). If the turn is already finishing (`!needs_follow_up`), no compaction even if context is full.
+
+---
+
+#### Full chain — local compaction
+
+```
+run_turn (turn.rs:150)
+  └─ run_pre_sampling_compact (turn.rs:766)
+       ├─ maybe_run_previous_model_inline_compact   [if model downshift]
+       └─ run_auto_compact (turn.rs:844)            [if token_limit_reached]
+            └─ run_inline_auto_compact_task (compact.rs:70)
+                 │  builds UserInput::Text from turn_context.compact_prompt()
+                 └─ run_compact_task_inner (compact.rs:123)
+                      │  runs pre/post compact hooks
+                      │  tracks CompactionAnalyticsAttempt
+                      └─ run_compact_task_inner_impl (compact.rs:194)
+```
+
+##### `run_compact_task_inner_impl` (`compact.rs:194`)
+
+**Request assembly:**
+
+```
+history = sess.clone_history()               ← snapshot of live history (sess.history untouched)
+history.record_items([compaction_prompt])    ← append SUMMARIZATION_PROMPT to local clone only
+prompt = Prompt {
+    input: history.clone().for_prompt(),
+    base_instructions: ...,
+    tools: []                               ← NO tools — pure summarization
+}
+drain_to_completed(sess, prompt)
+  → stripped-down event loop: no tool dispatch, no TUI streaming
+  → writes each OutputItemDone into sess.history   ← model's summary lands here
+  → on ContextWindowExceeded: history.remove_first_item(), retry
+```
+
+The compaction prompt is appended only to the local clone — `sess.history` stays intact until the new history is installed at the end.
+
+**Response → new history:**
+
+```
+summary_text = SUMMARY_PREFIX + get_last_assistant_message_from_turn(sess.history)
+               ← walks newest-to-oldest, finds last role:"assistant" message, strips citations
+
+user_messages = collect_user_messages(sess.history)
+               ← keeps only real user-typed messages:
+               ← drops contextual injections (env snapshots), previous summaries, everything else
+
+new_history = build_compacted_history(user_messages, summary_text)
+               ← walks user_messages newest→oldest, accumulates up to 20k tokens
+               ← partially-fitting message: truncate_middle (keeps head + tail, marker in middle)
+               ← reverses to chronological order
+```
+
+Final shape of `new_history`:
+
+```
+[ real user messages, oldest-first, up to 20k tokens ]
+[ summary as synthetic role:"user" message           ]  ← always last
+```
+
+All assistant messages, tool calls, tool outputs, reasoning — gone.
+
+**Install:**
+
+```
+sess.replace_compacted_history(new_history, reference_context_item)
+  → ContextManager.items replaced atomically
+  → auto_compact_window.start_next()   ← token window baseline reset
+  → model client window generation++  ← cache prefix invalidated
+sess.recompute_token_usage()
+```
+
+---
+
+#### `InitialContextInjection` — why it splits
+
+`DoNotInject` works for pre-turn and manual because compaction fires before the new turn's context has been recorded. The next call to `record_context_updates_and_set_reference_context_item` (line 158 in `run_turn`) sees `reference_context_item = None` and does a full fresh `build_initial_context` injection — clean slate.
+
+`BeforeLastUserMessage` is required for mid-turn because the model is mid-tool-chain. After `run_auto_compact` returns, the loop `continue`s immediately to the next `run_sampling_request`. There is no "next turn setup step" — the context must be in the history right now or the model loses all environment awareness.
+
+---
+
+#### Remote V2 differences
+
+| | Local | Remote V2 |
+|---|---|---|
+| Signal to model | Compaction prompt as `UserInput::Text` | `ResponseItem::CompactionTrigger` appended to input |
+| Tools in prompt | No (empty) | Yes (full `tool_router.model_visible_specs()`) |
+| Pre-truncation | No — retries on `ContextWindowExceeded` | Yes — `trim_function_call_history_to_fit_context_window` before API call |
+| Response format | Plain text assistant message | `ResponseItem::Compaction { encrypted_content }` — opaque blob |
+| Retained items | Real user messages, up to 20k tokens | `user`+`developer`+`system` messages, up to 64k tokens |
+| Summary position | Synthetic `role:"user"` message, last | `Compaction` item, last |
+| `client_session` | Always fresh | Reuses turn's session (auto) / fresh (manual) |
+| Writes into `sess.history` during stream | Yes (`drain_to_completed`) | No — history built from pre-call snapshot + API output |
+| Warning emitted | Yes | No |
+| Retry budget | `stream_max_retries()` | `min(stream_max_retries(), 2)` |
+
+**Key V2 design points:**
+
+The `ResponseItem::Compaction { encrypted_content }` response is an opaque server-managed blob. The client never reads or interprets it — just stores it as the last item in the compacted history and passes it back on future requests. The server decrypts it to recover what was summarized. This is fundamentally different from local compaction where the summary is plain text the client assembles itself.
+
+`build_v2_compacted_history` builds the new history entirely from the **pre-call** `prompt_input` snapshot plus the `Compaction` output item — no reading back from `sess.history` after the stream. Cleaner than local's pattern of writing the model response into live history and then reading it back.
+
+V2 retains `developer` messages (permissions, instructions, personality) in addition to user messages because the server-side model may need them as context. Local discards everything except user messages since the local model produces a self-contained text summary.
+
+
 ### sandbox
+
+
+### Observability
+
+Four distinct layers, each serving a different fidelity/audience:
+
+```
+Raw wire traffic → rollout-trace bundles   (opt-in, full fidelity)
+Model responses  → rollout JSONL           (always on, per-session)
+Structured events→ OTEL logs pipeline      (codex_otel.log_only target)
+Spans            → OTEL traces pipeline    (codex_otel.trace_safe target)
+Aggregated stats → OTEL metrics            (counters + histograms → Statsig/OTLP)
+Live in-process  → ManualReader snapshot   → TUI turn separator
+```
+
+#### OTEL Setup (`otel/`)
+
+`OtelProvider` (`otel/src/provider.rs:56`) initializes three independent signal pipelines:
+- **Logs**: `build_logger()` (line 294) — bridges to `tracing` via `OpenTelemetryTracingBridge`
+- **Traces**: `build_tracer_provider()` (line 363) — `BatchSpanProcessor` → OTLP
+- **Metrics**: `MetricsClient::new()` (`metrics/client.rs:188`) — `PeriodicReader` + optional `ManualReader` for in-process snapshots
+
+Export targets (`otel/src/config.rs:88`): `Statsig` (→ `https://ab.chatgpt.com/otlp/v1/metrics`, disabled in debug builds), `OtlpGrpc`, `OtlpHttp`.
+
+Two target prefixes route signals (`otel/src/targets.rs`):
+- `codex_otel.log_only` → logs pipeline only
+- `codex_otel.trace_safe` → traces pipeline only (PII-safe content)
+
+W3C Trace Context (`otel/src/trace_context.rs`): reads `TRACEPARENT`/`TRACESTATE` env vars to continue an incoming trace, serializes current span for outbound propagation.
+
+#### Structured Events and Spans
+
+Macros `log_event!` / `trace_event!` / `log_and_trace_event!` (`otel/src/events/shared.rs:4,24,42`) emit `tracing::event!` with a standard field set: `event.timestamp`, `conversation.id`, `app.version`, `auth_mode`, `model`, `originator`, `user.account_id`.
+
+Per-request spans (`app-server/app_server_tracing.rs:24`): every JSON-RPC request gets an `app_server.request` span with `otel.kind="server"`, `rpc.method`, `rpc.transport`, `turn.id`. Inbound W3C trace context is extracted and set as parent.
+
+Turn span (`core/src/session/turn.rs:1838`): a `handle_responses` span opens per turn with `gen_ai.usage.*` and `codex.usage.*` fields pre-declared as `Empty`, filled in as the model streams tokens.
+
+#### Metrics (`otel/src/metrics/names.rs`)
+
+Counters:
+- `codex.process.start` — once per process
+- `codex.tool.call` (tags: `tool`, `success`), `codex.api_request` (tags: `status`, `success`)
+- `codex.sse_event`, `codex.websocket.request`, `codex.websocket.event`
+- `codex.hooks.run`, `codex.guardian.review`, `codex.thread.started`
+
+Histograms (duration ms):
+- `codex.turn.e2e_duration_ms`, `codex.turn.ttft.duration_ms`, `codex.turn.ttfm.duration_ms`
+- `codex.responses_api_overhead.duration_ms` (excludes engine+tool time)
+- `codex.startup.phase.duration_ms` (tags: `phase`, `status`)
+- `codex.tool.call.duration_ms`, `codex.hooks.run.duration_ms`
+
+Token usage (`core/src/tasks/mod.rs:689`): `codex.turn.token_usage` histogram, tag `token_type` ∈ `{input, cached_input, non_cached_input, output, reasoning_output}` — emitted as deltas at turn completion.
+
+#### Token Usage Flow
+
+```
+ResponseEvent::Completed { token_usage }
+  → SessionTelemetry::record_responses()   otel/src/events/session_telemetry.rs:401
+      records gen_ai.usage.* on active span
+  → sse_event_completed() structured log   (line 917)
+  → session::record_token_usage_info()     core/src/session/mod.rs:3058
+      updates cumulative TokenInfo
+      calls on_token_usage() on extension contributors
+  → turn completion delta                  core/src/tasks/mod.rs:640
+      emits codex.turn.token_usage histograms per token_type
+```
+
+#### Transport Telemetry (`codex-api/src/telemetry.rs`)
+
+- `SseTelemetry` (line 18): `on_sse_poll(result, duration)` — called after each SSE poll
+- `WebsocketTelemetry` (line 35): `on_ws_request(...)` and `on_ws_event(...)` — per WebSocket message
+- `run_with_request_telemetry()` (line 68): wraps `run_with_retry`, calls `RequestTelemetry::on_request(attempt, status, err, elapsed)` after each HTTP attempt
+
+`SessionTelemetry` implements both traits, forwarding to metric counters and structured events.
+
+#### Rollout JSONL (`rollout/src/recorder.rs`)
+
+`RolloutRecorder` (line 75): clone-able handle to a background tokio task writing to `~/.codex/sessions/{YYYY}/{MM}/{DD}/rollout-{timestamp}-{uuid}.jsonl`. Commands via `mpsc::channel<RolloutCmd>(256)`: `AddItems`, `Persist { ack }`, `Flush { ack }`, `Shutdown { ack }`.
+
+Each line is a JSON object with `timestamp` + tagged `RolloutItem`:
+- `SessionMeta` — written first; contains `cli_version`, `model_provider`, `cwd`, `git info`, `base_instructions`
+- `ResponseItem` — each model response item
+- `TurnContext` — per-turn cwd/metadata snapshot
+- `Compacted` — post-compaction replacement history
+- `EventMsg` — protocol events
+
+A SQLite state DB (`rollout/src/state_db.rs`) serves as a secondary index with filesystem-first listing and DB read-repair.
+
+#### Rollout-Trace Bundles (`rollout-trace/`)
+
+Opt-in via `CODEX_ROLLOUT_TRACE_ROOT`. More detailed than rollout JSONL — captures raw request/response payloads.
+
+Bundle structure:
+```
+<root>/<bundle-id>/
+  manifest.json
+  trace.jsonl       ← append-only raw events
+  payloads/         ← individual request/response files
+```
+
+`RawTraceEventPayload` (`rollout-trace/src/raw_event.rs:68`) variants:
+- `InferenceStarted/Completed/Failed/Cancelled` — with `RawPayloadRef` pointing to payload files, model name, `response_id`, `upstream_request_id`
+- `ToolCallStarted/RuntimeStarted/RuntimeEnded/Ended`
+- `CompactionRequest*`, `CodeCellStarted/Ended`, `AgentResultObserved`
+- `McpToolCallCorrelationAssigned` — links `tool_call_id` to `mcp_call_id`
+
+Replay: `replay_bundle()` (`rollout-trace/src/reducer/mod.rs`) reduces the JSONL through sub-reducers (`inference.rs`, `conversation.rs`, `tool.rs`) into a `RolloutTrace`, cached as `state.json`.
+
+#### In-Process Runtime Metrics (TUI Display)
+
+`RuntimeMetricsSummary` (`otel/src/metrics/runtime_metrics.rs:42`) snapshots the `ManualReader` delta at turn end. The TUI renders this in the per-turn separator (`tui/src/chatwidget/turn_runtime.rs:22`): tool count, API call count, TTFT, WebSocket timing, etc.
+
+
+
+
+### Skills
+
+### Permission
+
+The permission system has four distinct layers, each narrowing what the model can actually do.
+
+#### Layer 1: Permission Profile — filesystem + network policy
+
+The outermost layer is `PermissionProfile` (`protocol/src/models.rs`), which resolves to two runtime policies:
+
+- `FileSystemSandboxPolicy` — a list of `(path, access_mode)` entries where `access_mode` is `Read | Write | Deny`
+- `NetworkSandboxPolicy` — `Restricted | Enabled`
+
+Three built-in profiles exist (`core/src/config/permissions.rs:43-46`):
+
+| Profile | Effective policy |
+|---|---|
+| `:read-only` | `FileSystemSandboxKind::Restricted`, `:root = read` only |
+| `:workspace` | Read everywhere, write to project roots + `/tmp`; `.git`, `.agents`, `.codex` are read-only carveouts |
+| `:danger-full-access` | `FileSystemSandboxKind::Unrestricted` (no sandbox) |
+
+Users can define custom profiles in config TOML which can `extends:` a built-in as a base. Profiles compile down to a `FileSystemSandboxPolicy` at startup (`compile_permission_profile_selection`, `core/src/config/permissions.rs:411`).
+
+**Special paths:** The filesystem policy uses symbolic tokens like `:workspace_roots`, `:root`, `:tmpdir`, `:minimal`, `:slash_tmp` that resolve at runtime against the actual cwd. `.git`, `.agents`, `.codex` inside any writable root are automatically protected as read-only unless an explicit write rule exists (`protocol/src/permissions.rs:567-579`).
+
+#### Layer 2: AskForApproval — the action gate
+
+`AskForApproval` (`protocol/src/protocol.rs:760`) controls whether each action requires user confirmation before it executes:
+
+| Value | Meaning |
+|---|---|
+| `UnlessTrusted` | Only "known safe" read-only commands auto-approved; everything else asks user |
+| `OnFailure` | Auto-approve inside sandbox; escalate to user only if sandbox run fails |
+| `OnRequest` (default) | Model decides when to ask; guardian auto-reviewer handles prompts |
+| `Granular(config)` | Fine-grained: `sandbox_approval`, `rules`, skill approval toggleable independently |
+| `Never` | Never ask user; failures returned directly to model, no escalation |
+
+This policy is checked in every tool handler before execution: `tools/handlers/shell.rs:107`, `tools/handlers/apply_patch.rs:420`, `tools/handlers/unified_exec/exec_command.rs:193`, `tools/network_approval.rs:447`.
+
+#### Layer 3: The Guardian — AI-powered auto-reviewer
+
+When `AskForApproval` is `OnRequest` or `Granular` AND `approvals_reviewer == AutoReview`, approval prompts are routed to the **guardian** — a second AI session — instead of surfacing to the user (`guardian/review.rs:147`, `routes_approval_to_guardian`).
+
+How it works:
+1. The parent session compresses recent conversation history into a compact transcript (token budgets: 10k for messages, 10k for tools — `guardian/mod.rs:54-58`).
+2. A guardian review session runs with a 90-second timeout (`GUARDIAN_REVIEW_TIMEOUT`, `guardian/mod.rs:47`).
+3. The guardian produces structured JSON: `GuardianAssessment { risk_level, user_authorization, outcome, rationale }`.
+4. **Fail closed**: timeout, parse failure, or session error → block the action (not approve).
+5. If denied, the rationale is returned to the model as a `RespondToModel` error with instructions not to circumvent it (`GUARDIAN_REJECTION_INSTRUCTIONS`, `guardian/review.rs:47-53`).
+
+**Circuit breaker:** If the guardian denies too many times in a turn (3 consecutive OR 10 in the last 50 reviews), the session is hard-aborted (`guardian/mod.rs:49-50`, `guardian/review.rs:209-239`).
+
+#### Layer 4: OS-level sandbox enforcement
+
+The actual OS sandbox applied when a command runs:
+
+- **Linux**: `bwrap` (bubblewrap) + `landlock` kernel API (`linux-sandbox/` crate)
+- **macOS**: `seatbelt` (sandbox-exec) (`sandboxing/src/seatbelt.rs`)
+- **Windows**: Windows Sandbox (`windows-sandbox-rs/` crate)
+
+The `FileSystemSandboxPolicy` is translated into OS sandbox rules. If no sandbox is available, `assess_patch_safety` (`core/src/safety.rs:87-106`) either asks the user or rejects outright — it never silently skips enforcement.
+
+#### How the layers interact
+
+```
+Model requests shell command
+  │
+  ▼
+Layer 2: approval_policy check (shell.rs / apply_patch.rs / exec_command.rs)
+  ├─ Never          → reject escalation requests immediately
+  ├─ UnlessTrusted  → ask user unless is_safe_command()
+  ├─ OnRequest      → route to Layer 3 (guardian)
+  └─ OnFailure      → try sandbox first
+  │
+  ▼
+Layer 3: Guardian review (if OnRequest + AutoReview)
+  ├─ Approved       → proceed
+  └─ Denied/timeout → RespondToModel error (fail closed)
+  │
+  ▼
+Layer 1: FileSystemSandboxPolicy — paths verified against writable roots
+  │
+  ▼
+Layer 4: OS sandbox (bwrap / seatbelt / Windows Sandbox)
+  └─ Kernel enforces the actual access boundaries
+```
+
+#### Model awareness of permissions
+
+Permission information is sent to the model as part of its developer/system prompt at the start of every turn (`session/mod.rs:2777-2794`), assembled by `PermissionsInstructions::from_permission_profile()` (`prompts/src/permissions_instructions.rs:65`) from Markdown templates under `prompts/templates/permissions/`.
+
+The model is told: the active sandbox mode, concrete writable roots, deny-read globs, and how to request escalation (`sandbox_permissions = "require_escalated"` + `justification`). The model follows these instructions; the harness enforces them regardless. The model cannot bypass the OS sandbox by simply not asking.
