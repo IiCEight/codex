@@ -47,8 +47,7 @@ pub(super) struct SearchTool<B> {
     pub(super) metrics_client: Option<MetricsClient>,
 }
 
-#[async_trait::async_trait]
-impl<B> ToolExecutor<ToolCall> for SearchTool<B>
+impl<'call, B> ToolExecutor<ToolCall<'call>> for SearchTool<B>
 where
     B: MemoriesBackend,
 {
@@ -63,9 +62,21 @@ where
         )
     }
 
-    async fn handle(
+    fn handle<'a>(&'a self, call: ToolCall<'call>) -> codex_extension_api::ToolExecutorFuture<'a>
+    where
+        'call: 'a,
+    {
+        Box::pin(self.handle_call(call))
+    }
+}
+
+impl<B> SearchTool<B>
+where
+    B: MemoriesBackend,
+{
+    async fn handle_call(
         &self,
-        call: ToolCall,
+        call: ToolCall<'_>,
     ) -> Result<Box<dyn codex_extension_api::ToolOutput>, codex_extension_api::FunctionCallError>
     {
         let backend = self.backend.clone();

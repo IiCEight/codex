@@ -5,6 +5,7 @@ use crate::context::InternalModelContextFragment;
 use crate::context::SubagentNotification;
 use codex_protocol::items::HookPromptFragment;
 use codex_protocol::items::build_hook_prompt_message;
+use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ResponseItem;
 use pretty_assertions::assert_eq;
 
@@ -16,11 +17,51 @@ fn detects_environment_context_fragment() {
 }
 
 #[test]
+fn detects_skill_instructions_fragment_case_insensitively() {
+    for text in [
+        "<skill>\n<name>demo</name>\n</skill>",
+        "  <SKILL>\n<name>demo</name>\n</SKILL>  ",
+    ] {
+        assert!(is_contextual_user_fragment(&ContentItem::InputText {
+            text: text.to_string(),
+        }));
+    }
+}
+
+#[test]
 fn detects_agents_instructions_fragment() {
-    assert!(is_contextual_user_fragment(&ContentItem::InputText {
-        text: "# AGENTS.md instructions for /tmp\n\n<INSTRUCTIONS>\nbody\n</INSTRUCTIONS>"
-            .to_string(),
-    }));
+    for text in [
+        "# AGENTS.md instructions for /tmp\n\n<INSTRUCTIONS>\nbody\n</INSTRUCTIONS>",
+        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nbody\n</INSTRUCTIONS>",
+    ] {
+        assert!(is_contextual_user_fragment(&ContentItem::InputText {
+            text: text.to_string(),
+        }));
+    }
+}
+
+#[test]
+fn renders_agents_instructions_with_legacy_directory_header() {
+    assert_eq!(
+        UserInstructions {
+            directory: Some("/tmp".to_string()),
+            text: "body".to_string(),
+        }
+        .render(),
+        "# AGENTS.md instructions for /tmp\n\n<INSTRUCTIONS>\nbody\n</INSTRUCTIONS>"
+    );
+}
+
+#[test]
+fn renders_agents_instructions_without_directory_header() {
+    assert_eq!(
+        UserInstructions {
+            directory: None,
+            text: "body".to_string(),
+        }
+        .render(),
+        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nbody\n</INSTRUCTIONS>"
+    );
 }
 
 #[test]
@@ -32,18 +73,30 @@ fn detects_subagent_notification_fragment_case_insensitively() {
 
 #[test]
 fn detects_internal_model_context_fragment() {
-    let text = InternalModelContextFragment::new(
+    let fragment = InternalModelContextFragment::new(
         InternalContextSource::from_static("extension"),
         "Internal steering.",
-    )
-    .render();
+    );
+    let text = fragment.render();
 
+    assert_eq!(
+        fragment.content_kind(),
+        ContentItemKind("extension.internal_context".to_string())
+    );
     assert_eq!(
         text,
         "<codex_internal_context source=\"extension\">\nInternal steering.\n</codex_internal_context>"
     );
     assert!(is_contextual_user_fragment(&ContentItem::InputText {
         text
+    }));
+}
+
+#[test]
+fn detects_recommended_plugins_fragment() {
+    assert!(is_contextual_user_fragment(&ContentItem::InputText {
+        text: "<recommended_plugins>\n- Google Drive (google-drive@openai-curated-remote)\n</recommended_plugins>"
+            .to_string(),
     }));
 }
 

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::catalog::SkillCatalog;
 use crate::catalog::SkillProviderError;
+use crate::catalog::SkillProviderResult;
 use crate::catalog::SkillReadResult;
 use crate::catalog::SkillSearchResult;
 use crate::catalog::SkillSourceKind;
@@ -39,15 +40,15 @@ impl SkillProviderSource {
         Self::new(SkillSourceKind::Executor, label, provider)
     }
 
-    pub fn remote(label: impl Into<String>, provider: Arc<dyn SkillProvider>) -> Self {
-        Self::new(SkillSourceKind::Remote, label, provider)
+    pub fn cloud(label: impl Into<String>, provider: Arc<dyn SkillProvider>) -> Self {
+        Self::new(SkillSourceKind::Cloud, label, provider)
     }
 
     fn should_list(&self, query: &SkillListQuery) -> bool {
         match &self.kind {
             SkillSourceKind::Host => query.include_host_skills,
-            SkillSourceKind::Executor => !query.executor_authorities.is_empty(),
-            SkillSourceKind::Remote => query.include_remote_skills,
+            SkillSourceKind::Executor => !query.executor_roots.is_empty(),
+            SkillSourceKind::Cloud => query.include_cloud_skills,
             SkillSourceKind::Custom(_) => true,
         }
     }
@@ -94,20 +95,70 @@ impl SkillProviders {
         self
     }
 
-    pub fn with_remote_provider(mut self, provider: Arc<dyn SkillProvider>) -> Self {
+    pub fn with_cloud_provider(mut self, provider: Arc<dyn SkillProvider>) -> Self {
         self.sources
-            .push(SkillProviderSource::remote("remote", provider));
+            .push(SkillProviderSource::cloud("cloud", provider));
         self
     }
 
+    pub(crate) fn has_cloud_provider(&self) -> bool {
+        self.sources
+            .iter()
+            .any(|source| source.kind == SkillSourceKind::Cloud)
+    }
+
+    pub(crate) fn has_host_provider(&self) -> bool {
+        self.sources
+            .iter()
+            .any(|source| source.kind == SkillSourceKind::Host)
+    }
+
     pub(crate) async fn list_for_turn(&self, query: SkillListQuery) -> SkillCatalog {
+        self.list_matching(&query, |source| source.should_list(&query))
+            .await
+    }
+
+    pub(crate) async fn list_cloud_for_turn(
+        &self,
+        query: SkillListQuery,
+    ) -> SkillProviderResult<SkillCatalog> {
         let mut catalog = SkillCatalog::default();
 
         for source in self
             .sources
             .iter()
-            .filter(|source| source.should_list(&query))
+            .filter(|source| source.kind == SkillSourceKind::Cloud)
         {
+            let source_catalog = source.provider.list(query.clone()).await.map_err(|err| {
+                SkillProviderError::new(format!(
+                    "{} skills unavailable: {}",
+                    source.label, err.message
+                ))
+            })?;
+            catalog.extend(source_catalog);
+        }
+
+        Ok(catalog)
+    }
+
+    pub(crate) async fn list_executor_for_turn(&self, query: SkillListQuery) -> SkillCatalog {
+        self.list_matching(&query, |source| source.kind == SkillSourceKind::Executor)
+            .await
+    }
+
+    pub(crate) async fn list_host_for_turn(&self, query: SkillListQuery) -> SkillCatalog {
+        self.list_matching(&query, |source| source.kind == SkillSourceKind::Host)
+            .await
+    }
+
+    async fn list_matching(
+        &self,
+        query: &SkillListQuery,
+        should_list: impl Fn(&SkillProviderSource) -> bool,
+    ) -> SkillCatalog {
+        let mut catalog = SkillCatalog::default();
+
+        for source in self.sources.iter().filter(|source| should_list(source)) {
             extend_catalog(
                 &mut catalog,
                 source.provider.list(query.clone()).await,
@@ -120,7 +171,7 @@ impl SkillProviders {
 
     pub(crate) async fn read(
         &self,
-        request: SkillReadRequest,
+        request: SkillReadRequest<'_>,
     ) -> Result<SkillReadResult, SkillProviderError> {
         let mut last_error = None;
         for source in self

@@ -2,31 +2,46 @@ use codex_api::ImageBackground;
 use codex_api::ImageEditRequest;
 use codex_api::ImageGenerationRequest;
 use codex_api::ImageQuality;
-use codex_api::ImageUrl;
-use codex_core::context::extension_image_generation_output_hint;
 use codex_extension_api::ToolOutput;
 use codex_extension_api::ToolPayload;
 use codex_extension_api::ToolSpec;
+use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_tools::ResponsesApiNamespaceTool;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 
 use super::GeneratedImageOutput;
 use super::ImageRequest;
-use super::ImagegenAction;
 use super::ImagegenArgs;
 use super::imagegen_tool_spec;
-use super::request_for_action;
+use super::request_for_call_args;
 use crate::IMAGE_GEN_NAMESPACE;
 use crate::IMAGEGEN_TOOL_NAME;
+use crate::artifact::image_generation_artifact_path;
+use crate::artifact::image_generation_output_hint;
 
 const RESULT: &str = "cG5n";
+
+#[test]
+fn artifact_path_sanitizes_session_and_call_ids() {
+    let save_root = AbsolutePathBuf::current_dir().expect("current directory should be absolute");
+
+    assert_eq!(
+        image_generation_artifact_path(&save_root, "../session", "../call"),
+        save_root
+            .join("generated_images")
+            .join("___session")
+            .join("___call.png")
+    );
+}
 
 #[test]
 fn uses_reserved_image_gen_namespace() {
@@ -34,18 +49,30 @@ fn uses_reserved_image_gen_namespace() {
         panic!("imagegen should advertise a namespace tool");
     };
     assert_eq!(spec.name, IMAGE_GEN_NAMESPACE);
-    let ResponsesApiNamespaceTool::Function(function) = &spec.tools[0];
+    let ResponsesApiNamespaceTool::Function(function) = &spec.tools[0] else {
+        panic!("imagegen should advertise a function tool");
+    };
     assert_eq!(function.name, IMAGEGEN_TOOL_NAME);
 }
 
-#[test]
-fn generate_uses_fixed_request_defaults() {
+#[tokio::test]
+async fn omitted_references_generate_with_fixed_defaults() {
     assert_eq!(
-        request_for_action(&args(ImagegenAction::Generate, "paint a moonlit lake"), &[])
-            .expect("generation request should build"),
+        request_for_call_args(
+            &ImagegenArgs {
+                prompt: "paint a moonlit lake".to_string(),
+                transparent_background: false,
+                referenced_image_paths: None,
+                num_last_images_to_include: None,
+            },
+            &[],
+            &[],
+        )
+        .await
+        .expect("generation request should build"),
         ImageRequest::Generate(ImageGenerationRequest {
             prompt: "paint a moonlit lake".to_string(),
-            background: Some(ImageBackground::Auto),
+            background: Some(ImageBackground::Opaque),
             model: "gpt-image-2".to_string(),
             n: None,
             quality: Some(ImageQuality::Auto),
@@ -54,10 +81,277 @@ fn generate_uses_fixed_request_defaults() {
     );
 }
 
+#[tokio::test]
+async fn recent_image_fallback_selects_newest_images_in_chronological_order() {
+    let history = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![
+                input_image("user-1"),
+                input_image("user-2"),
+                ContentItem::InputText {
+                    text: "edit these".to_string(),
+                },
+            ],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "mcp_image".to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            call_id: "mcp-call".to_string(),
+            encrypted_function_args: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: Some("mcp-call".to_string()),
+            name: None,
+            namespace: None,
+            output: image_output("mcp"),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::CustomToolCall {
+            id: None,
+            status: Some("completed".to_string()),
+            call_id: "code-mode-call".to_string(),
+            name: "exec".to_string(),
+            namespace: None,
+            input: String::new(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::CustomToolCallOutput {
+            id: None,
+            call_id: "code-mode-call".to_string(),
+            name: Some("exec".to_string()),
+            output: image_output("code-mode"),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::ImageGenerationCall {
+            id: Some(ResponseItemId::with_suffix("ig", "generated-call")),
+            status: "completed".to_string(),
+            revised_prompt: None,
+            result: "generated".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: None,
+            name: Some("notifications".to_string()),
+            namespace: Some("slack".to_string()),
+            output: image_output("standalone"),
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+
+    assert_eq!(
+        request_for_call_args(
+            &ImagegenArgs {
+                prompt: "change the lighting".to_string(),
+                transparent_background: false,
+                referenced_image_paths: None,
+                num_last_images_to_include: Some(5),
+            },
+            &history,
+            &[],
+        )
+        .await
+        .expect("history-backed edit request should build"),
+        ImageRequest::Edit(expected_edit_request(
+            "change the lighting",
+            &["user-2", "mcp", "code-mode", "generated", "standalone"],
+        ))
+    );
+}
+
+#[tokio::test]
+async fn recent_image_fallback_passes_file_backed_image_to_edit_request() {
+    let request = request_for_call_args(
+        &ImagegenArgs {
+            prompt: "change the lighting".to_string(),
+            transparent_background: false,
+            referenced_image_paths: None,
+            num_last_images_to_include: Some(1),
+        },
+        &[ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![
+                input_image("older-inline-image"),
+                ContentItem::InputImage {
+                    image: ImageReference::File {
+                        file_id: "newer-file-backed-image".to_string(),
+                    },
+                    detail: None,
+                },
+            ],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }],
+        &[],
+    )
+    .await
+    .expect("a selected file-backed image should be passed through");
+
+    assert_eq!(
+        request,
+        ImageRequest::Edit(ImageEditRequest {
+            images: vec![ImageReference::File {
+                file_id: "newer-file-backed-image".to_string(),
+            }],
+            prompt: "change the lighting".to_string(),
+            background: Some(ImageBackground::Opaque),
+            model: "gpt-image-2".to_string(),
+            n: None,
+            quality: Some(ImageQuality::Auto),
+            size: Some("auto".to_string()),
+        })
+    );
+}
+
+/// Tool-output file references must count toward the window instead of exposing an older image.
+#[tokio::test]
+async fn recent_image_fallback_passes_file_backed_tool_output_to_edit_request() {
+    let request = request_for_call_args(
+        &ImagegenArgs {
+            prompt: "change the lighting".to_string(),
+            transparent_background: false,
+            referenced_image_paths: None,
+            num_last_images_to_include: Some(1),
+        },
+        &[
+            ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: Some("older-inline-output".to_string()),
+                name: None,
+                namespace: None,
+                output: image_output("older-inline-image"),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::CustomToolCallOutput {
+                id: None,
+                call_id: "newer-file-backed-output".to_string(),
+                name: Some("view_image".to_string()),
+                output: FunctionCallOutputPayload::from_content_items(vec![
+                    FunctionCallOutputContentItem::InputImage {
+                        image: ImageReference::File {
+                            file_id: "newer-file-backed-image".to_string(),
+                        },
+                        detail: None,
+                    },
+                ]),
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ],
+        &[],
+    )
+    .await
+    .expect("a selected file-backed tool output should be passed through");
+
+    assert_eq!(
+        request,
+        ImageRequest::Edit(ImageEditRequest {
+            images: vec![ImageReference::File {
+                file_id: "newer-file-backed-image".to_string(),
+            }],
+            prompt: "change the lighting".to_string(),
+            background: Some(ImageBackground::Opaque),
+            model: "gpt-image-2".to_string(),
+            n: None,
+            quality: Some(ImageQuality::Auto),
+            size: Some("auto".to_string()),
+        })
+    );
+}
+
+#[tokio::test]
+async fn conflicting_image_selectors_return_tool_error() {
+    let error = request_for_call_args(
+        &ImagegenArgs {
+            prompt: "change the lighting".to_string(),
+            transparent_background: false,
+            referenced_image_paths: Some(vec![
+                "/tmp/image.png"
+                    .try_into()
+                    .expect("test path should be absolute"),
+            ]),
+            num_last_images_to_include: Some(1),
+        },
+        &[],
+        &[],
+    )
+    .await
+    .expect_err("conflicting selectors should fail");
+
+    assert_eq!(
+        error.to_string(),
+        "provide only one of `referenced_image_paths` or `num_last_images_to_include`"
+    );
+}
+
+#[tokio::test]
+async fn too_many_referenced_image_paths_return_tool_error() {
+    let error = request_for_call_args(
+        &ImagegenArgs {
+            prompt: "change the lighting".to_string(),
+            transparent_background: false,
+            referenced_image_paths: Some(
+                (0..6)
+                    .map(|index| {
+                        format!("/tmp/image-{index}.png")
+                            .try_into()
+                            .expect("test path should be absolute")
+                    })
+                    .collect(),
+            ),
+            num_last_images_to_include: None,
+        },
+        &[],
+        &[],
+    )
+    .await
+    .expect_err("too many paths should fail before reading files");
+
+    assert_eq!(
+        error.to_string(),
+        "`referenced_image_paths` must contain at most 5 paths"
+    );
+}
+
+#[tokio::test]
+async fn recent_image_fallback_requires_requested_count() {
+    let error = request_for_call_args(
+        &ImagegenArgs {
+            prompt: "change the lighting".to_string(),
+            transparent_background: false,
+            referenced_image_paths: None,
+            num_last_images_to_include: Some(2),
+        },
+        &[ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![input_image("only-image")],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }],
+        &[],
+    )
+    .await
+    .expect_err("history-backed edit should require the requested image count");
+
+    assert_eq!(
+        error.to_string(),
+        "requested the last 2 conversation images, but only 1 were available"
+    );
+}
+
 #[test]
 fn generated_output_returns_image_input_and_output_hint() {
     let output_hint =
-        extension_image_generation_output_hint("/tmp", "/tmp/call-1.png").expect("hint should fit");
+        image_generation_output_hint("/tmp", "/tmp/call-1.png").expect("hint should fit");
     let output = GeneratedImageOutput {
         result: RESULT.to_string(),
         output_hint: Some(output_hint.clone()),
@@ -77,7 +371,9 @@ fn generated_output_returns_image_input_and_output_hint() {
         content_items,
         vec![
             FunctionCallOutputContentItem::InputImage {
-                image_url: format!("data:image/png;base64,{RESULT}"),
+                image: ImageReference::Inline {
+                    image_url: format!("data:image/png;base64,{RESULT}")
+                },
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
             FunctionCallOutputContentItem::InputText { text: output_hint },
@@ -106,7 +402,7 @@ fn generated_output_omits_oversized_output_hint() {
     let long_path = "x".repeat(1024);
     let output = GeneratedImageOutput {
         result: RESULT.to_string(),
-        output_hint: extension_image_generation_output_hint("/tmp", long_path),
+        output_hint: image_generation_output_hint("/tmp", long_path),
     };
 
     let ResponseInputItem::FunctionCallOutput {
@@ -122,236 +418,46 @@ fn generated_output_omits_oversized_output_hint() {
     assert_eq!(
         content_items,
         vec![FunctionCallOutputContentItem::InputImage {
-            image_url: format!("data:image/png;base64,{RESULT}"),
+            image: ImageReference::Inline {
+                image_url: format!("data:image/png;base64,{RESULT}")
+            },
             detail: Some(DEFAULT_IMAGE_DETAIL),
         }]
     );
 }
 
-#[test]
-fn edit_matches_context_selector_for_generated_images_after_latest_user_anchor() {
-    let history = vec![
-        generated_item("g1"),
-        generated_item("g2"),
-        generated_item("g3"),
-        ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![
-                ContentItem::InputImage {
-                    image_url: "data:image/png;base64,u1".to_string(),
-                    detail: None,
-                },
-                ContentItem::InputImage {
-                    image_url: "data:image/png;base64,u2".to_string(),
-                    detail: None,
-                },
-            ],
-            phase: None,
+fn input_image(image: &str) -> ContentItem {
+    ContentItem::InputImage {
+        image: ImageReference::Inline {
+            image_url: format!("data:image/png;base64,{image}"),
         },
-        generated_item("g4"),
-        generated_item("g5"),
-        generated_item("g6"),
-        generated_item("g7"),
-    ];
-
-    assert_eq!(
-        edit_request("change the lighting", &history),
-        expected_edit_request(
-            "change the lighting",
-            &[
-                "data:image/png;base64,u1",
-                "data:image/png;base64,u2",
-                "data:image/png;base64,g5",
-                "data:image/png;base64,g6",
-                "data:image/png;base64,g7",
-            ]
-        )
-    );
-}
-
-#[test]
-fn edit_preserves_a_generated_image_when_user_anchor_fills_the_limit() {
-    let history = vec![
-        ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: ["a", "b", "c", "d", "e"]
-                .into_iter()
-                .map(|image| ContentItem::InputImage {
-                    image_url: format!("data:image/png;base64,{image}"),
-                    detail: None,
-                })
-                .collect(),
-            phase: None,
-        },
-        generated_item("generated"),
-    ];
-
-    assert_eq!(
-        edit_request("edit the last generated image", &history),
-        expected_edit_request(
-            "edit the last generated image",
-            &[
-                "data:image/png;base64,b",
-                "data:image/png;base64,c",
-                "data:image/png;base64,d",
-                "data:image/png;base64,e",
-                "data:image/png;base64,generated",
-            ]
-        )
-    );
-}
-
-#[test]
-fn edit_uses_latest_user_upload_before_a_text_only_follow_up() {
-    let history = vec![
-        ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputImage {
-                image_url: "data:image/png;base64,user".to_string(),
-                detail: None,
-            }],
-            phase: None,
-        },
-        ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "edit this image".to_string(),
-            }],
-            phase: None,
-        },
-    ];
-
-    assert_eq!(
-        edit_request("change the lighting", &history),
-        expected_edit_request("change the lighting", &["data:image/png;base64,user"])
-    );
-}
-
-#[test]
-fn edit_reuses_images_from_prior_standalone_imagegen_calls() {
-    let history = vec![
-        ResponseItem::FunctionCall {
-            id: None,
-            name: IMAGEGEN_TOOL_NAME.to_string(),
-            namespace: Some(IMAGE_GEN_NAMESPACE.to_string()),
-            arguments: "{}".to_string(),
-            call_id: "imagegen-1".to_string(),
-        },
-        generated_function_output("imagegen-1", "standalone"),
-    ];
-
-    assert_eq!(
-        edit_request("change the lighting", &history),
-        expected_edit_request("change the lighting", &["data:image/png;base64,standalone"])
-    );
-}
-
-#[test]
-fn edit_keeps_newest_standalone_generated_images_when_over_limit() {
-    let history = (1..=6)
-        .flat_map(|index| {
-            let call_id = format!("imagegen-{index}");
-            vec![
-                ResponseItem::FunctionCall {
-                    id: None,
-                    name: IMAGEGEN_TOOL_NAME.to_string(),
-                    namespace: Some(IMAGE_GEN_NAMESPACE.to_string()),
-                    arguments: "{}".to_string(),
-                    call_id: call_id.clone(),
-                },
-                generated_function_output(&call_id, &index.to_string()),
-            ]
-        })
-        .collect::<Vec<_>>();
-
-    assert_eq!(
-        edit_request("change the lighting", &history),
-        expected_edit_request(
-            "change the lighting",
-            &[
-                "data:image/png;base64,2",
-                "data:image/png;base64,3",
-                "data:image/png;base64,4",
-                "data:image/png;base64,5",
-                "data:image/png;base64,6",
-            ]
-        )
-    );
-}
-
-#[test]
-fn edit_without_image_history_returns_tool_error() {
-    let error = request_for_action(&args(ImagegenAction::Edit, "change the lighting"), &[])
-        .expect_err("edit should require image context");
-
-    assert_eq!(
-        error.to_string(),
-        "image edit requested without any usable image in conversation history"
-    );
-}
-
-fn args(action: ImagegenAction, prompt: &str) -> ImagegenArgs {
-    ImagegenArgs {
-        prompt: prompt.to_string(),
-        action,
+        detail: None,
     }
 }
 
-fn edit_request(prompt: &str, history: &[ResponseItem]) -> ImageEditRequest {
-    let ImageRequest::Edit(request) =
-        request_for_action(&args(ImagegenAction::Edit, prompt), history)
-            .expect("edit request should build")
-    else {
-        panic!("expected edit request");
-    };
-    request
+fn image_output(image: &str) -> FunctionCallOutputPayload {
+    FunctionCallOutputPayload::from_content_items(vec![FunctionCallOutputContentItem::InputImage {
+        image: ImageReference::Inline {
+            image_url: format!("data:image/png;base64,{image}"),
+        },
+        detail: None,
+    }])
 }
 
 fn expected_edit_request(prompt: &str, images: &[&str]) -> ImageEditRequest {
     ImageEditRequest {
         images: images
             .iter()
-            .map(|image_url| ImageUrl {
-                image_url: (*image_url).to_string(),
+            .map(|image| ImageReference::Inline {
+                image_url: format!("data:image/png;base64,{image}"),
             })
             .collect(),
         prompt: prompt.to_string(),
-        background: Some(ImageBackground::Auto),
+        background: Some(ImageBackground::Opaque),
         model: "gpt-image-2".to_string(),
         n: None,
         quality: Some(ImageQuality::Auto),
         size: Some("auto".to_string()),
-    }
-}
-
-fn generated_item(result: &str) -> ResponseItem {
-    ResponseItem::ImageGenerationCall {
-        id: format!("id-{result}"),
-        status: "completed".to_string(),
-        revised_prompt: None,
-        result: result.to_string(),
-    }
-}
-
-fn generated_function_output(call_id: &str, result: &str) -> ResponseItem {
-    ResponseItem::FunctionCallOutput {
-        call_id: call_id.to_string(),
-        output: FunctionCallOutputPayload {
-            body: FunctionCallOutputBody::ContentItems(vec![
-                FunctionCallOutputContentItem::InputImage {
-                    image_url: format!("data:image/png;base64,{result}"),
-                    detail: Some(DEFAULT_IMAGE_DETAIL),
-                },
-                FunctionCallOutputContentItem::InputText {
-                    text: "generated image save hint".to_string(),
-                },
-            ]),
-            success: Some(true),
-        },
     }
 }
 
